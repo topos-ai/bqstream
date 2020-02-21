@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 
 	storage "cloud.google.com/go/bigquery/storage/apiv1beta1"
 	"github.com/googleapis/gax-go/v2"
@@ -50,46 +51,102 @@ func BigQueryStream(ctx context.Context, req *BigQueryStreamRequest) error {
 		return fmt.Errorf("no streams in session")
 	}
 
+	// Establish a decoder that can process blocks of messages using the
+	// reference schema. All blocks share the same schema, so the decoder
+	// can be long-lived.
+	codec, err := goavro.NewCodec(session.GetAvroSchema().GetSchema())
+	if err != nil {
+		return fmt.Errorf("couldn't create codec: %v", err)
+	}
+
 	// Add a cancel context.
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// The readers write to a row channel.
 	ch := make(chan *storagepb.AvroRows)
 
+	// Cretae the errors channel.
+	errs := make(chan error)
+
 	// Read using all available streams.
 	readStreams := session.GetStreams()
-	processStreamErrs := make([]chan error, len(readStreams))
-	for i, readStream := range readStreams {
-		processStreamErrs[i] = make(chan error)
-		go func(readStream *storagepb.Stream, errs chan error) {
-			defer close(errs)
+	processStreamWaitGroup := &sync.WaitGroup{}
+	for _, readStream := range readStreams {
+		processStreamWaitGroup.Add(1)
+		go func(readStream *storagepb.Stream) {
+			defer processStreamWaitGroup.Done()
 			if err := processStream(ctx, c, readStream, ch); err != nil {
-				errs <- err
+				select {
+				case errs <- err:
+				case <-ctx.Done():
+				}
 			}
-		}(readStream, processStreamErrs[i])
+		}(readStream)
 	}
 
-	errs := make(chan error)
 	go func() {
-		defer close(errs)
-		if err := processAvro(ctx, session.GetAvroSchema().GetSchema(), ch, req.Processor); err != nil {
-			errs <- err
-		}
+		processStreamWaitGroup.Wait()
+		close(ch)
+		close(errs)
 	}()
 
-	var streamErr error
-	for _, errs := range processStreamErrs {
-		for streamErr = range errs {
-			cancel()
+	for {
+		select {
+		case <-ctx.Done():
+
+			// Context was cancelled. Stop.
+			return ctx.Err()
+
+		case err := <-errs:
+
+			// Return the first error we receive.
+			return err
+
+		case rows, ok := <-ch:
+			if !ok {
+
+				// Channel closed, no further avro messages. Stop.
+				return nil
+			}
+
+			undecoded := rows.GetSerializedBinaryRows()
+			for len(undecoded) > 0 {
+				datum, remainingBytes, err := codec.NativeFromBinary(undecoded)
+				if err == io.EOF {
+					break
+				}
+
+				if err != nil {
+					return fmt.Errorf("decoding error with %d bytes remaining: %v", len(undecoded), err)
+				}
+
+				typeMaps, ok := datum.(map[string]interface{})
+				if !ok {
+					return fmt.Errorf("failed type assertion: %v", datum)
+				}
+
+				values := map[string]interface{}{}
+				for key, typeMapInterface := range typeMaps {
+					typeMap, ok := typeMapInterface.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					for _, value := range typeMap {
+						values[key] = value
+						break
+					}
+				}
+
+				if err := req.Processor(values); err != nil {
+					return err
+				}
+
+				undecoded = remainingBytes
+			}
 		}
 	}
-
-	close(ch)
-	for streamErr = range errs {
-	}
-
-	cancel()
-	return streamErr
 }
 
 // rpcOpts is used to configure the underlying gRPC client to accept large
@@ -140,72 +197,6 @@ func processStream(ctx context.Context, client *storage.BigQueryStorageClient, s
 				// Bookmark our progress in case of retries and send the rowblock on the channel.
 				offset = offset + rc
 				ch <- r.GetAvroRows()
-			}
-		}
-	}
-}
-
-// processAvro receives row blocks from a channel, and uses the provided Avro
-// schema to decode the blocks into individual row messages for printing. Will
-// continue to run until the channel is closed or the provided context is
-// cancelled.
-func processAvro(ctx context.Context, schema string, ch <-chan *storagepb.AvroRows, processor func(map[string]interface{}) error) error {
-
-	// Establish a decoder that can process blocks of messages using the
-	// reference schema. All blocks share the same schema, so the decoder
-	// can be long-lived.
-	codec, err := goavro.NewCodec(schema)
-	if err != nil {
-		return fmt.Errorf("couldn't create codec: %v", err)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-
-			// Context was cancelled. Stop.
-			return nil
-		case rows, ok := <-ch:
-			if !ok {
-
-				// Channel closed, no further avro messages. Stop.
-				return nil
-			}
-
-			undecoded := rows.GetSerializedBinaryRows()
-			for len(undecoded) > 0 {
-				datum, remainingBytes, err := codec.NativeFromBinary(undecoded)
-				if err == io.EOF {
-					break
-				}
-
-				if err != nil {
-					return fmt.Errorf("decoding error with %d bytes remaining: %v", len(undecoded), err)
-				}
-
-				typeMaps, ok := datum.(map[string]interface{})
-				if !ok {
-					return fmt.Errorf("failed type assertion: %v", datum)
-				}
-
-				values := map[string]interface{}{}
-				for key, typeMapInterface := range typeMaps {
-					typeMap, ok := typeMapInterface.(map[string]interface{})
-					if !ok {
-						continue
-					}
-
-					for _, value := range typeMap {
-						values[key] = value
-						break
-					}
-				}
-
-				if err := processor(values); err != nil {
-					return err
-				}
-
-				undecoded = remainingBytes
 			}
 		}
 	}
